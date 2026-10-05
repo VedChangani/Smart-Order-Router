@@ -1,241 +1,571 @@
 # Smart Order Router (SOR) Simulator
 
-A simulated distributed stock trading platform built for a Computer Networks
-course project. It demonstrates TCP client/server programming, a custom
-JSON application-layer protocol, concurrent request handling with
-`ExecutorService`, and a real smart-order-routing algorithm (parallel
-quoting, best-price selection, and order splitting across venues).
+A distributed stock-trading simulation built in **Java 21** that models how a Smart Order Router (SOR) evaluates multiple exchanges, selects the best available prices, splits orders across venues when necessary, and aggregates the resulting executions into a single execution report.
 
-## 1. Architecture
+The system consists of a trading client, a smart order router, and multiple independent exchange servers communicating through **TCP sockets** using a lightweight **newline-delimited JSON protocol**.
 
-```
-                 TCP (JSON protocol)              TCP (JSON protocol)
-  Trading Client  ------------------->  Smart Order Router  ------------------->  Exchange: NYSE
-  Trading Client  ------------------->        (Router)      ------------------->  Exchange: NASDAQ
-  Trading Client  ------------------->                      ------------------->  Exchange: BSE
-```
+> **Note:** This is a simulation environment. It does not connect to live exchanges, real market data, or real trading infrastructure.
 
-* **Trading Client** (`com.sor.client`) — console app. Sends `BUY`/`SELL`
-  orders to the Router over one persistent TCP connection and prints the
-  `ExecutionReport` it gets back.
-* **Smart Order Router** (`com.sor.router`) — a TCP **server** to clients and
-  a TCP **client** to every exchange. For each order it:
-  1. Queries every exchange **in parallel** for price/quantity.
-  2. Picks the best-priced exchange(s) and **splits** the order across them
-     if no single exchange can fill it alone.
-  3. Sends `EXECUTE` requests to each chosen exchange.
-  4. Reduces the results into one `ExecutionReport` for the client.
-* **Exchange Server** (`com.sor.exchange`) — an independent TCP server, one
-  process per exchange, each with its own in-memory `Inventory`
-  (symbol → price / available quantity / capacity). Responds to `QUERY` and
-  `EXECUTE` requests.
-* **Common module** (`com.sor.common`) — shared DTOs (`model`), the wire
-  protocol (`protocol`), configuration loading (`config`) and a logging
-  helper (`util`), used by all three roles.
+---
 
-### Package layout
+## Overview
 
-```
-com.sor.common.model     OrderRequest, ExecutionReport, Fill, QueryRequest/Response,
-                          ExecuteRequest/Response, OrderSide, OrderStatus
-com.sor.common.protocol  MessageType, ProtocolMessage, MessageParser, JsonUtil,
-                          ProtocolConstants, MessageValidator, ValidationException
-com.sor.common.config    AppConfig, ExchangeEndpoint, RouterConfig
-com.sor.common.util      LoggingConfig
-com.sor.exchange          InventoryItem, Inventory, ExchangeService,
-                          ExchangeClientHandler, ExchangeServer (main)
-com.sor.router            ExchangeConnector, ExchangeQueryService, OrderAllocator,
-                          Allocation, ExecutionEngine, RouterClientHandler,
-                          SmartOrderRouter (main)
-com.sor.client             RouterConnector, TradingClient (main)
+In a fragmented market, the same security can be available at different prices and quantities across multiple trading venues.
+
+A Smart Order Router sits between the trader and those venues. Instead of sending an order directly to one exchange, it can:
+
+1. Query multiple venues for available liquidity.
+2. Compare their prices.
+3. Select the most favorable execution opportunities.
+4. Split a large order across multiple exchanges when a single venue cannot fill it.
+5. Execute the allocated quantities.
+6. Aggregate all fills into one execution report.
+
+This project simulates that workflow using independent TCP processes.
+
+```text
+                         TCP / JSON
+┌─────────────────┐                      ┌─────────────────────┐
+│  Trading Client │ ───────────────────► │ Smart Order Router │
+└─────────────────┘                      └──────────┬──────────┘
+                                                    │
+                                      TCP / JSON    │    TCP / JSON
+                                         ┌──────────┼──────────┐
+                                         ▼          ▼          ▼
+                                   ┌──────────┐ ┌──────────┐ ┌──────────┐
+                                   │   NYSE   │ │  NASDAQ  │ │   BSE    │
+                                   │ Exchange │ │ Exchange │ │ Exchange │
+                                   └──────────┘ └──────────┘ └──────────┘
 ```
 
-## 2. Wire protocol
+---
 
-Every message on every socket is a single line of JSON — a `ProtocolMessage`
-envelope with a `type` and a `payload` (the JSON of the actual DTO, so the
-receiver knows exactly which class to parse it into):
+## Key Features
+
+- **Smart price routing** across multiple simulated exchanges
+- **Order splitting** when liquidity is insufficient at a single venue
+- **Parallel quote collection** from exchanges using `ExecutorService`
+- **Concurrent client handling** at the router and exchange servers
+- **Persistent client-to-router TCP connection**
+- **Short-lived router-to-exchange connections**
+- **Custom JSON application-layer protocol**
+- **Request validation** before business logic execution
+- **Partial-fill handling**
+- **Graceful degradation** when an exchange becomes unavailable
+- **Socket and router-level timeouts**
+- **Thread-safe in-memory exchange inventory**
+- **Aggregated execution reports** with per-exchange fills
+- **Externalized `.properties` configuration**
+- **Single fat JAR** for running all system components
+
+---
+
+## System Architecture
+
+The application is divided into three runtime roles and a shared module.
+
+### Trading Client
+
+The trading client is a console application used to submit orders.
+
+It:
+
+- Establishes one persistent TCP connection to the router.
+- Accepts `BUY` and `SELL` commands.
+- Sends an `ORDER_REQUEST`.
+- Waits for an `EXECUTION_REPORT`.
+- Displays the execution details and individual fills.
+
+### Smart Order Router
+
+The router is the core of the system.
+
+It acts as:
+
+- a **TCP server** for trading clients
+- a **TCP client** for the configured exchanges
+
+For every incoming order, the router:
+
+1. Validates the request.
+2. Queries all configured exchanges in parallel.
+3. Discards failed or zero-liquidity responses.
+4. Sorts available venues according to the order side.
+5. Allocates the requested quantity across the best venues.
+6. Sends execution requests to the selected exchanges.
+7. Aggregates the actual fills.
+8. Returns one final `ExecutionReport` to the client.
+
+### Exchange Servers
+
+Each exchange runs as an independent process with its own in-memory inventory.
+
+An exchange supports two operations:
+
+- `QUERY_REQUEST` — report the current price and available quantity.
+- `EXECUTE_REQUEST` — execute as much of the requested order as the exchange can fill.
+
+Each exchange can therefore have different prices and liquidity for the same symbol.
+
+### Common Module
+
+The common package contains functionality shared across all processes:
+
+- DTOs
+- protocol definitions
+- JSON serialization
+- message parsing
+- validation
+- configuration
+- logging
+
+---
+
+## Order Routing Logic
+
+The routing strategy is deliberately simple and deterministic.
+
+### BUY orders
+
+For a `BUY`, the router prefers the **lowest price**.
+
+```text
+Cheapest ───────────────────────────────► Most expensive
+
+NASDAQ        NYSE        BSE
+2743.60       2745.10     2746.80
+```
+
+The router consumes liquidity from the cheapest venue first and moves to the next venue only when necessary.
+
+### SELL orders
+
+For a `SELL`, the router prefers the **highest price**.
+
+```text
+Highest ────────────────────────────────► Lowest
+
+NASDAQ        NYSE        BSE
+246.10        245.75      245.40
+```
+
+This maximizes the simulated execution price for the seller.
+
+---
+
+## Order Splitting
+
+Each exchange has finite liquidity.
+
+For a symbol, an exchange maintains:
+
+- `price`
+- `availableQuantity`
+- `maxCapacity`
+
+For a `BUY`, the available quantity represents how many shares the exchange can sell.
+
+For a `SELL`, the available quantity is constrained by the exchange's remaining capacity:
+
+```text
+sellCapacity = maxCapacity - availableQuantity
+```
+
+### Example
+
+Suppose a `BUY GOOG 400` order arrives:
+
+```text
+NASDAQ → 200 @ 2743.60
+NYSE   → 150 @ 2745.10
+BSE    → 120 @ 2746.80
+```
+
+No single exchange can fill all 400 shares.
+
+The router therefore allocates:
+
+```text
+NASDAQ → 200
+NYSE   → 150
+BSE    →  50
+----------------
+Total   → 400
+```
+
+The final execution report contains all three fills and calculates the weighted average execution price.
+
+---
+
+## Execution Flow
+
+A complete order follows this path:
+
+```text
+Client
+  │
+  │ ORDER_REQUEST
+  ▼
+Router
+  │
+  ├────────── QUERY_REQUEST ──────────► NYSE
+  │◄───────── QUERY_RESPONSE ─────────┘
+  │
+  ├────────── QUERY_REQUEST ──────────► NASDAQ
+  │◄───────── QUERY_RESPONSE ─────────┘
+  │
+  ├────────── QUERY_REQUEST ──────────► BSE
+  │◄───────── QUERY_RESPONSE ─────────┘
+  │
+  │ Select best prices
+  │ Allocate quantity
+  │
+  ├──────── EXECUTE_REQUEST ──────────► Best venue
+  │◄─────── EXECUTE_RESPONSE ─────────┘
+  │
+  ├──────── EXECUTE_REQUEST ──────────► Next venue
+  │◄─────── EXECUTE_RESPONSE ─────────┘
+  │
+  │ Aggregate fills
+  │
+  │ EXECUTION_REPORT
+  ▼
+Client
+```
+
+---
+
+## Communication Protocol
+
+All network messages use a common JSON envelope:
 
 ```json
-{"type":"ORDER_REQUEST","payload":"{\"clientId\":\"C1\",\"symbol\":\"AAPL\",\"side\":\"BUY\",\"quantity\":100}"}
+{
+  "type": "ORDER_REQUEST",
+  "payload": "{\"clientId\":\"CLIENT-1\",\"symbol\":\"AAPL\",\"side\":\"BUY\",\"quantity\":100}"
+}
 ```
 
-| type              | direction                | payload class    |
-|-------------------|--------------------------|-------------------|
-| `ORDER_REQUEST`   | Client → Router          | `OrderRequest`    |
-| `EXECUTION_REPORT`| Router → Client          | `ExecutionReport` |
-| `QUERY_REQUEST`   | Router → Exchange        | `QueryRequest`    |
-| `QUERY_RESPONSE`  | Exchange → Router        | `QueryResponse`   |
-| `EXECUTE_REQUEST` | Router → Exchange        | `ExecuteRequest`  |
-| `EXECUTE_RESPONSE`| Exchange → Router        | `ExecuteResponse` |
-| `ERROR`           | either direction         | `String` (reason) |
+The outer message identifies the message type, while the `payload` contains the serialized DTO.
 
-`MessageValidator` rejects malformed requests (missing symbol, non-positive
-quantity, missing side, etc.) before they ever reach business logic, and the
-handler replies with an `ERROR` message instead of crashing the connection.
+### Message Types
 
-## 3. Order splitting algorithm (Stage 7)
+| Message | Direction | Purpose |
+|---|---|---|
+| `ORDER_REQUEST` | Client → Router | Submit a trading order |
+| `EXECUTION_REPORT` | Router → Client | Return final execution result |
+| `QUERY_REQUEST` | Router → Exchange | Request price and available liquidity |
+| `QUERY_RESPONSE` | Exchange → Router | Return quote information |
+| `EXECUTE_REQUEST` | Router → Exchange | Request an actual execution |
+| `EXECUTE_RESPONSE` | Exchange → Router | Return execution result |
+| `ERROR` | Either direction | Report invalid or unsupported requests |
 
-Each exchange models **limited liquidity on both sides**:
+Messages are **newline-delimited JSON**, allowing each socket to process one complete message per line.
 
-* `availableQuantity` — how much stock it currently holds and can *sell* to
-  a client (fills client `BUY` orders).
-* `maxCapacity - availableQuantity` — how much more it can *buy* from a
-  client before running out of room (fills client `SELL` orders).
+---
 
-When the Router processes an order it:
-1. Queries all exchanges in parallel (`ExchangeQueryService`, Stage 6) and
-   keeps only the ones that responded successfully with quantity > 0.
-2. Sorts them by best price — **ascending** for `BUY` (cheapest first),
-   **descending** for `SELL` (highest first).
-3. Greedily allocates the requested quantity across that sorted list,
-   taking as much as each exchange can offer before moving to the next
-   (`OrderAllocator`).
-4. Sends one `EXECUTE_REQUEST` per allocation and aggregates the real fills
-   into the final `ExecutionReport`, which reports `FILLED`,
-   `PARTIALLY_FILLED`, or `REJECTED` depending on how much of the order
-   actually got filled.
+## Concurrency Model
 
-## 4. Failure handling (Stage 8)
+Concurrency is used at multiple levels of the system.
 
-* **Socket timeouts** — `ExchangeConnector` sets both a connect timeout and
-  a read timeout per socket; a hung exchange cannot block the router
-  forever.
-* **Router-level timeout** — `ExchangeQueryService` also bounds each
-  `Future.get(...)` with `router.queryTimeoutMs` as a second safety net.
-* **Exchange unavailable** — a `ConnectException` / timeout for one exchange
-  is caught, logged, and turned into a *failed* `QueryResponse` for just
-  that exchange; the router keeps going with whichever exchanges did
-  respond (graceful degradation — see Test Scenario 5 below).
-* **Partial fills** — if the total liquidity across all reachable exchanges
-  is less than the requested quantity, the order is reported
-  `PARTIALLY_FILLED` with the real executed quantity, instead of throwing.
-* **No liquidity anywhere** — if no exchange can fill any of the order, it
-  is reported `REJECTED` with a clear reason, and the client is told why.
-* **Client-side** — if the router itself is unreachable, `TradingClient`
-  prints a clean message and exits instead of leaking a stack trace.
+### Router
 
-## 5. Build
+The router accepts client connections using an `ExecutorService`.
 
-Requires **Java 21** and **Maven**. From the project root:
+Each connected trading client is handled independently, allowing multiple clients to interact with the router concurrently.
+
+### Parallel Exchange Queries
+
+When processing an order, exchange quote requests are dispatched concurrently rather than querying exchanges sequentially.
+
+This allows the router to collect quotes without making the total query time depend linearly on the number of exchanges.
+
+### Exchange Servers
+
+Each exchange also uses an executor-backed client handler, allowing multiple router connections to be served concurrently.
+
+### Thread-Safe Inventory
+
+Inventory mutations are synchronized at the individual `InventoryItem` level so concurrent executions against the same symbol cannot update its quantity inconsistently.
+
+---
+
+## Failure Handling
+
+The system is designed to continue operating when individual components fail.
+
+### Exchange Timeout
+
+Router-to-exchange connections use both connection and read timeouts.
+
+A non-responsive exchange therefore cannot block the router indefinitely.
+
+### Exchange Unavailable
+
+When an exchange is unreachable:
+
+```text
+NYSE       ✓
+NASDAQ     ✓
+BSE        ✗ unavailable
+```
+
+The router excludes the failed venue and continues using the exchanges that responded successfully.
+
+### Partial Fill
+
+When total available liquidity is lower than the requested quantity, the router returns:
+
+```text
+PARTIALLY_FILLED
+```
+
+instead of treating the order as an application error.
+
+For example:
+
+```text
+Requested: 1200
+Executed:  1100
+Status:    PARTIALLY_FILLED
+```
+
+### No Liquidity
+
+When no reachable exchange can execute the order, the result is:
+
+```text
+REJECTED
+```
+
+with a descriptive message.
+
+### Router Unavailable
+
+The trading client handles connection failures cleanly and exits without exposing an uncontrolled stack trace.
+
+---
+
+## Project Structure
+
+```text
+src/
+└── main/
+    ├── java/
+    │   └── com/
+    │       └── sor/
+    │           ├── client/
+    │           │   ├── RouterConnector.java
+    │           │   └── TradingClient.java
+    │           │
+    │           ├── common/
+    │           │   ├── config/
+    │           │   ├── model/
+    │           │   ├── protocol/
+    │           │   └── util/
+    │           │
+    │           ├── exchange/
+    │           │   ├── ExchangeClientHandler.java
+    │           │   ├── ExchangeServer.java
+    │           │   ├── ExchangeService.java
+    │           │   ├── Inventory.java
+    │           │   └── InventoryItem.java
+    │           │
+    │           └── router/
+    │               ├── Allocation.java
+    │               ├── ExchangeConnector.java
+    │               ├── ExchangeQueryService.java
+    │               ├── ExecutionEngine.java
+    │               ├── OrderAllocator.java
+    │               ├── RouterClientHandler.java
+    │               └── SmartOrderRouter.java
+    │
+    └── resources/
+        ├── router.properties
+        ├── NYSE.properties
+        ├── NASDAQ.properties
+        ├── BSE.properties
+        └── logging.properties
+```
+## Getting Started
+
+### Prerequisites
+
+Make sure the following are installed:
+
+- Java 21+
+- Maven 3.9+
+
+Verify:
+
+```bash
+java -version
+mvn -version
+```
+
+---
+
+## Build
+
+From the project root:
 
 ```bash
 mvn clean package
 ```
 
-This produces a single runnable fat jar containing all three entry points
-plus Jackson: `target/sor-simulator.jar`.
+This creates:
 
-> Note: this jar bundles everything needed to run any of the three roles;
-> you pick which one to run with the fully-qualified main class on the
-> command line, as shown below.
+```text
+target/sor-simulator.jar
+```
 
-## 6. Run
+The JAR contains all application components and their required dependencies.
 
-Open **5 terminals** in the project root (3 exchanges + 1 router + 1+ client).
+---
+
+## Running the System
+
+The simplest setup uses five terminals.
+
+### 1. Start NYSE
 
 ```bash
-# Terminal 1 — NYSE exchange
 java -cp target/sor-simulator.jar com.sor.exchange.ExchangeServer NYSE
+```
 
-# Terminal 2 — NASDAQ exchange
+### 2. Start NASDAQ
+
+```bash
 java -cp target/sor-simulator.jar com.sor.exchange.ExchangeServer NASDAQ
+```
 
-# Terminal 3 — BSE exchange
+### 3. Start BSE
+
+```bash
 java -cp target/sor-simulator.jar com.sor.exchange.ExchangeServer BSE
+```
 
-# Terminal 4 — Smart Order Router (start after the exchanges are up)
+### 4. Start the Smart Order Router
+
+Start the router after the exchanges are running:
+
+```bash
 java -cp target/sor-simulator.jar com.sor.router.SmartOrderRouter router
+```
 
-# Terminal 5 — Trading Client
+### 5. Start a Trading Client
+
+```bash
 java -cp target/sor-simulator.jar com.sor.client.TradingClient localhost 6000 CLIENT-1
 ```
 
-Bundled sample configs (in `src/main/resources`, packaged into the jar):
+You can launch additional clients in separate terminals to demonstrate concurrent client handling.
 
-* `router.properties` — router port `6000`, exchanges `NYSE:localhost:7001`,
-  `NASDAQ:localhost:7002`, `BSE:localhost:7003`.
-* `NYSE.properties`, `NASDAQ.properties`, `BSE.properties` — each exchange's
-  port and starting inventory (`SYMBOL:price:availableQuantity:maxCapacity`),
-  with slightly different prices per exchange so best-price routing has
-  something real to choose between.
+---
 
-You can also point any role at your own properties file instead of a
-bundled name, e.g. `java -cp target/sor-simulator.jar com.sor.exchange.ExchangeServer /path/to/my-exchange.properties`.
+## Trading Client
 
-### Running without building a jar first
+Once connected, the client accepts:
 
-```bash
-mvn exec:java -Dexec.mainClass=com.sor.exchange.ExchangeServer -Dexec.args=NYSE
-mvn exec:java -Dexec.mainClass=com.sor.router.SmartOrderRouter -Dexec.args=router
-mvn exec:java -Dexec.mainClass=com.sor.client.TradingClient -Dexec.args="localhost 6000 CLIENT-1"
-```
-
-### Trading Client commands
-
-```
-BUY <SYMBOL> <QUANTITY>    e.g. BUY AAPL 500
-SELL <SYMBOL> <QUANTITY>   e.g. SELL TSLA 200
+```text
+BUY <SYMBOL> <QUANTITY>
+SELL <SYMBOL> <QUANTITY>
 HELP
 EXIT
 ```
 
-## 7. Test scenarios (Stage 9)
+Examples:
 
-These were run and verified against the bundled sample configuration.
+```text
+BUY AAPL 100
+```
 
-**1. Simple single-exchange fill**
-`BUY AAPL 100` → NYSE quotes the best price (189.50) with plenty of
-inventory, so the whole order fills there. Status `FILLED`, one fill line.
+```text
+SELL TSLA 200
+```
 
-**2. Order split across three exchanges (BUY)**
-`BUY GOOG 400` → no single exchange has 400 shares (NYSE 150, NASDAQ 200,
-BSE 120 = 470 total). The router fills NASDAQ (cheapest, 200) → NYSE (150)
-→ BSE (50) until 400 shares are filled. Status `FILLED`, three fill lines,
-correctly weighted average price.
+A successful order produces an execution report containing:
 
-**3. Order split across three exchanges (SELL)**
-`SELL TSLA 500` → sorted by *highest* price this time (NASDAQ 246.10 → NYSE
-245.75 → BSE 245.40), filled up to each exchange's remaining buy capacity.
-Status `FILLED`, three fill lines.
+- Order ID
+- Client ID
+- Symbol
+- Side
+- Requested quantity
+- Executed quantity
+- Execution status
+- Per-exchange fills
+- Average execution price
+- Total trade value
+- Execution message
 
-**4. Unknown symbol**
-`BUY FAKESYM 10` → every exchange reports "symbol not found", so the router
-returns `REJECTED` with a clear message instead of guessing.
+---
 
-**5. Exchange goes down mid-session (graceful degradation)**
-Kill the BSE process, then send `BUY MSFT 100`. The router's query to BSE
-fails (connection refused), is logged as a warning, and is simply excluded
-— the order still fills normally from NYSE/NASDAQ. The client sees a normal
-`FILLED` report with no indication anything went wrong on the backend.
+## Configuration
 
-**6. Genuine partial fill**
-With BSE still down, request more of a symbol than NYSE + NASDAQ combined
-can supply, e.g. `BUY MSFT 1200` when only 1100 remain between them.
-Result: `PARTIALLY_FILLED`, `executedQuantity=1100`, with fills from both
-remaining exchanges and a message stating exactly how much filled.
+The default router configuration is:
 
-**7. Router unreachable**
-Start `TradingClient` before the router is up (or after killing it).
-It prints `Could not connect to router at localhost:6000 - Connection
-refused` and exits cleanly — no stack trace, no hang.
+```properties
+router.port=6000
+router.exchanges=NYSE:localhost:7001,NASDAQ:localhost:7002,BSE:localhost:7003
+router.connectTimeoutMs=3000
+router.readTimeoutMs=4000
+router.queryTimeoutMs=4000
+```
 
-## 8. Design notes / assumptions
+Each exchange has its own configuration.
 
-* Each exchange models **finite liquidity on both sides** of the market via
-  `availableQuantity` (stock on hand, limits client `BUY`s) and
-  `maxCapacity` (warehouse ceiling, limits client `SELL`s) — this is what
-  makes order splitting a real necessity rather than a decorative feature.
-* `ExchangeConnector` opens a fresh, short-lived socket per query/execute
-  call. This keeps the router's TCP-client side simple and stateless and
-  makes it trivial to run many exchange calls concurrently from
-  `ExchangeQueryService`'s thread pool without any shared-connection
-  synchronization.
-* A Trading Client connection stays open for the whole session — one
-  `ORDER_REQUEST`/`EXECUTION_REPORT` pair per line — so a user can place
-  several orders without reconnecting each time.
-* `InventoryItem`'s mutating methods are `synchronized` so concurrent
-  `EXECUTE_REQUEST`s for the same symbol (from different router threads or
-  different router instances) never race.
-* Logging uses `java.util.logging` throughout, configured once at startup
-  from `logging.properties`.
+Example:
+
+```properties
+exchange.name=NYSE
+exchange.port=7001
+inventory=AAPL:189.50:400:800,GOOG:2745.10:150:300,MSFT:415.20:600:1000
+```
+
+Inventory entries follow:
+
+```text
+SYMBOL:price:availableQuantity:maxCapacity
+```
+
+The application can load configuration either from the classpath or from an external `.properties` file.
+
+For example:
+
+```bash
+java -cp target/sor-simulator.jar com.sor.exchange.ExchangeServer /path/to/exchange.properties
+```
+
+This makes it possible to create different simulated market conditions without changing the Java source code.
+
+## Project Highlights
+
+This project demonstrates several practical systems concepts in one application:
+
+```text
+Networking
+    │
+    ├── TCP client/server communication
+    ├── Connection lifecycle management
+    └── Timeout handling
+    │
+Concurrency
+    │
+    ├── Concurrent client sessions
+    ├── Parallel exchange queries
+    └── Thread-safe inventory mutation
+    │
+Application Protocol
+    │
+    ├── Message envelopes
+    ├── JSON serialization
+    ├── Request validation
+    └── Error responses
+    │
+Trading Logic
+    │
+    ├── Best-price selection
+    ├── Liquidity-aware allocation
+    ├── Order splitting
+    └── Execution aggregation
+```
